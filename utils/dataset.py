@@ -8,6 +8,8 @@ import torch
 from PIL import Image
 from torch.utils import data
 
+from tqdm import tqdm
+
 FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp'
 
 
@@ -19,82 +21,103 @@ class Dataset(data.Dataset):
         self.input_size = input_size
 
         # Read labels
-        cache = self.load_label(filenames)
-        labels, shapes = zip(*cache.values())
-        self.labels = list(labels)
-        self.shapes = numpy.array(shapes, dtype=numpy.float64)
-        self.filenames = list(cache.keys())  # update
-        self.n = len(shapes)  # number of samples
+        labels = self.load_label(filenames)
+        # print(f"labels: {labels.keys()}")
+        self.labels = list(labels.values())
+        self.filenames = list(labels.keys())  # update
+        self.n = len(self.filenames)  # number of samples
         self.indices = range(self.n)
         # Albumentations (optional, only used if package is installed)
         self.albumentations = Albumentations()
 
     def __getitem__(self, index):
         index = self.indices[index]
+        filename = self.filenames[index]  # Get the filename for the current index
+        # print(index,"\t\t", filename)
 
-        params = self.params
-        mosaic = self.mosaic and random.random() < params['mosaic']
-
-        if mosaic:
-            shapes = None
+        if self.mosaic and random.random() < self.params['mosaic']:
+            # print("mosaic mode")
             # Load MOSAIC
-            image, label = self.load_mosaic(index, params)
+            image, label = self.load_mosaic(index, self.params, filename)
+            # print to verify if the number of labels match the image
+            # print(f"labels of {index}\t: {len(label)}\t{filename}")
             # MixUp augmentation
-            if random.random() < params['mix_up']:
+            if random.random() < self.params['mix_up']:
                 index = random.choice(self.indices)
                 mix_image1, mix_label1 = image, label
-                mix_image2, mix_label2 = self.load_mosaic(index, params)
+                mix_image2, mix_label2 = self.load_mosaic(index, self.params, filename)
 
                 image, label = mix_up(mix_image1, mix_label1, mix_image2, mix_label2)
         else:
+            # print("no mosaic mode")
             # Load image
             image, shape = self.load_image(index)
             h, w = image.shape[:2]
 
             # Resize
             image, ratio, pad = resize(image, self.input_size, self.augment)
-            shapes = shape, ((h / shape[0], w / shape[1]), pad)  # for COCO mAP rescaling
 
             label = self.labels[index].copy()
             if label.size:
                 label[:, 1:] = wh2xy(label[:, 1:], ratio[0] * w, ratio[1] * h, pad[0], pad[1])
             if self.augment:
-                image, label = random_perspective(image, label, params)
+                image, label = random_perspective(image, label, self.params)
+            # print to verify if the number of labels match the image
+            # print(f"labels of non-mosaic {index}\t: {len(label)}\t{filename}")
+
+        # print(f"labels of overall {index}\t: {len(label)}\t{filename}")
         nl = len(label)  # number of labels
-        if nl:
-            label[:, 1:5] = xy2wh(label[:, 1:5], image.shape[1], image.shape[0])
+
+        # # check if number of labels are zero (0)
+        # assert nl, f"detected {nl} labels for file number {index} ({filename})"  # Include index and filename
+
+        h, w = image.shape[:2]
+        cls = label[:, 0:1]
+        box = label[:, 1:5]
+        # cls = label[:, 0:1] if nl > 0 and label.ndim > 1 else numpy.empty((0, 1), dtype=numpy.float32)
+        # box = label[:, 1:5] if nl > 0 and label.ndim > 1 else numpy.empty((0, 4), dtype=numpy.float32)
+        box = xy2wh(box, w, h)
 
         if self.augment:
             # Albumentations
-            image, label = self.albumentations(image, label)
-            nl = len(label)  # update after albumentations
+            image, box, cls = self.albumentations(image, box, cls)
+            nl = len(box)  # update after albumentations
             # HSV color-space
-            augment_hsv(image, params)
+            augment_hsv(image, self.params)
             # Flip up-down
-            if random.random() < params['flip_ud']:
+            if random.random() < self.params['flip_ud']:
                 image = numpy.flipud(image)
                 if nl:
-                    label[:, 2] = 1 - label[:, 2]
+                    box[:, 1] = 1 - box[:, 1]
             # Flip left-right
-            if random.random() < params['flip_lr']:
+            if random.random() < self.params['flip_lr']:
                 image = numpy.fliplr(image)
                 if nl:
-                    label[:, 1] = 1 - label[:, 1]
+                    box[:, 0] = 1 - box[:, 0]
 
-        target = torch.zeros((nl, 6))
-        if nl:
-            target[:, 1:] = torch.from_numpy(label)
+        target_cls = torch.zeros((nl, 1))
+        target_box = torch.zeros((nl, 4))
+        # if nl:
+        #     target_cls = torch.from_numpy(cls)
+        #     target_box = torch.from_numpy(box)
+        if nl > 0:
+            # Ensure cls has at least 2 dimensions before converting
+            if cls.ndim == 1:
+                cls = cls.reshape(-1, 1)
+            target_cls = torch.from_numpy(cls)
+            target_box = torch.from_numpy(box)
 
         # Convert HWC to CHW, BGR to RGB
         sample = image.transpose((2, 0, 1))[::-1]
         sample = numpy.ascontiguousarray(sample)
 
-        return torch.from_numpy(sample), target, shapes
+        return torch.from_numpy(sample), target_cls, target_box, torch.zeros(nl)
 
     def __len__(self):
         return len(self.filenames)
 
     def load_image(self, i):
+        # print(self.filenames[i])
         image = cv2.imread(self.filenames[i])
         h, w = image.shape[:2]
         r = self.input_size / max(h, w)
@@ -104,18 +127,19 @@ class Dataset(data.Dataset):
                                interpolation=resample() if self.augment else cv2.INTER_LINEAR)
         return image, (h, w)
 
-    def load_mosaic(self, index, params):
+    def load_mosaic(self, index, params, filename):
+        # print(index, "\t", filename)
         label4 = []
+        border = [-self.input_size // 2, -self.input_size // 2]
         image4 = numpy.full((self.input_size * 2, self.input_size * 2, 3), 0, dtype=numpy.uint8)
         y1a, y2a, x1a, x2a, y1b, y2b, x1b, x2b = (None, None, None, None, None, None, None, None)
-
-        border = [-self.input_size // 2, -self.input_size // 2]
 
         xc = int(random.uniform(-border[0], 2 * self.input_size + border[1]))
         yc = int(random.uniform(-border[0], 2 * self.input_size + border[1]))
 
         indices = [index] + random.choices(self.indices, k=3)
         random.shuffle(indices)
+        # print(indices)
 
         for i, index in enumerate(indices):
             # Load image
@@ -158,12 +182,16 @@ class Dataset(data.Dataset):
                 x2b = min(shape[1], x2a - x1a)
                 y2b = min(y2a - y1a, shape[0])
 
-            image4[y1a:y2a, x1a:x2a] = image[y1b:y2b, x1b:x2b]
             pad_w = x1a - x1b
             pad_h = y1a - y1b
+            image4[y1a:y2a, x1a:x2a] = image[y1b:y2b, x1b:x2b]
 
             # Labels
             label = self.labels[index].copy()
+            # # debugging labels
+            # print(f"Image of label (non-mosaic, index {index}): {self.filenames[index]})")
+            # print(f"Shape of label (non-mosaic, index {index}): {label.shape}")
+            # print(f"Content of label (non-mosaic, index {index}):\n{label}")
             if len(label):
                 label[:, 1:] = wh2xy(label[:, 1:], shape[1], shape[0], pad_w, pad_h)
             label4.append(label)
@@ -180,20 +208,55 @@ class Dataset(data.Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        samples, targets, shapes = zip(*batch)
-        for i, item in enumerate(targets):
-            item[:, 0] = i  # add target image index
-        return torch.stack(samples, 0), torch.cat(targets, 0), shapes
+        samples, cls, box, indices = zip(*batch)
+
+        # # debugging cls
+        # print("--- Inspecting cls list ---")
+        # for i, c in enumerate(cls):
+        #     print(f"Length of cls[{i}]: {len(c)}")
+        #     if isinstance(c, torch.Tensor):
+        #         print(f"Shape of cls[{i}]: {c.shape}")
+        #         print(f"Content of cls[{i}]: {c}")
+        #     else:
+        #         print(f"Type of cls[{i}]: {type(c)}")
+        #         print(f"Content of cls[{i}]: {c}")
+        # print("--- End of cls inspection ---")
+
+        try:
+            cls = torch.cat(cls, dim=0)
+        except RuntimeError as e:
+            print(f"Error during torch.cat on cls: {e}")
+            raise e
+        
+        # cls = torch.cat(cls, dim=0)
+        box = torch.cat(box, dim=0)
+
+        new_indices = list(indices)
+        for i in range(len(indices)):
+            new_indices[i] += i
+        indices = torch.cat(new_indices, dim=0)
+
+        targets = {'cls': cls,
+                   'box': box,
+                   'idx': indices}
+        return torch.stack(samples, dim=0), targets
 
     @staticmethod
     def load_label(filenames):
         path = f'{os.path.dirname(filenames[0])}.cache'
+        print(path)
         if os.path.exists(path):
-            return torch.load(path)
+            print("cache loaded")
+            return torch.load(path, weights_only=False)
+        else:
+            print("cache not loaded")
+        # nothing = 0   # troubleshooting files without labels
         x = {}
-        for filename in filenames:
+        for filename in tqdm(filenames):
+            # print(filename)
             try:
                 # verify images
+                # print(f"file exists: {os.path.isfile(filename)}")
                 with open(filename, 'rb') as f:
                     image = Image.open(f)
                     image.verify()  # PIL verify
@@ -202,28 +265,45 @@ class Dataset(data.Dataset):
                 assert image.format.lower() in FORMATS, f'invalid image format {image.format}'
 
                 # verify labels
-                a = f'{os.sep}images{os.sep}'
-                b = f'{os.sep}labels{os.sep}'
-                if os.path.isfile(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt'):
-                    with open(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt') as f:
+                # a = f'{os.sep}images{os.sep}'
+                # b = f'{os.sep}labels{os.sep}'
+                a = 'images'
+                b = 'labels'
+                # print(a)
+                # print(os.path.isfile(filename), filename)
+                # file_txt = b.join(filename.rsplit(b, 1)).rsplit('.', 1)[0] + '.txt'
+                file_txt = filename.replace(a, b).rsplit('.', 1)[0] + '.txt'
+                # print(os.path.isfile(file_txt), file_txt)
+                if os.path.isfile(file_txt):
+                    with open(file_txt) as f:
                         label = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                        # print(label)
                         label = numpy.array(label, dtype=numpy.float32)
                     nl = len(label)
+                    # print(f"cache label {nl}\t{file_txt}")
                     if nl:
-                        assert label.shape[1] == 5, 'labels require 5 columns'
-                        assert (label >= 0).all(), 'negative label values'
-                        assert (label[:, 1:] <= 1).all(), 'non-normalized coordinates'
+                        assert (label >= 0).all()
+                        assert label.shape[1] == 5
+                        assert (label[:, 1:] <= 1).all()
                         _, i = numpy.unique(label, axis=0, return_index=True)
                         if len(i) < nl:  # duplicate row check
                             label = label[i]  # remove duplicates
                     else:
+                        # print(f"no label:\t{file_txt}")
+                        # nothing += 1
                         label = numpy.zeros((0, 5), dtype=numpy.float32)
                 else:
+                    # print(f"no file:\t{file_txt}")
+                    # nothing += 1
                     label = numpy.zeros((0, 5), dtype=numpy.float32)
-                if filename:
-                    x[filename] = [label, shape]
             except FileNotFoundError:
-                pass
+                # nothing += 1
+                label = numpy.zeros((0, 5), dtype=numpy.float32)
+            except AssertionError:
+                # nothing += 1
+                continue
+            x[filename] = label
+        # print(f"nothing: {nothing}")
         torch.save(x, path)
         return x
 
@@ -239,7 +319,7 @@ def wh2xy(x, w=640, h=640, pad_w=0, pad_h=0):
     return y
 
 
-def xy2wh(x, w=640, h=640):
+def xy2wh(x, w, h):
     # warning: inplace clip
     x[:, [0, 2]] = x[:, [0, 2]].clip(0, w - 1E-3)  # x1, x2
     x[:, [1, 3]] = x[:, [1, 3]].clip(0, h - 1E-3)  # y1, y2
@@ -277,8 +357,8 @@ def augment_hsv(image, params):
     lut_s = numpy.clip(x * r[1], 0, 255).astype('uint8')
     lut_v = numpy.clip(x * r[2], 0, 255).astype('uint8')
 
-    im_hsv = cv2.merge((cv2.LUT(h, lut_h), cv2.LUT(s, lut_s), cv2.LUT(v, lut_v)))
-    cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR, dst=image)  # no return needed
+    hsv = cv2.merge((cv2.LUT(h, lut_h), cv2.LUT(s, lut_s), cv2.LUT(v, lut_v)))
+    cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR, dst=image)  # no return needed
 
 
 def resize(image, input_size, augment):
@@ -313,14 +393,14 @@ def candidates(box1, box2):
     return (w2 > 2) & (h2 > 2) & (w2 * h2 / (w1 * h1 + 1e-16) > 0.1) & (aspect_ratio < 100)
 
 
-def random_perspective(samples, targets, params, border=(0, 0)):
-    h = samples.shape[0] + border[0] * 2
-    w = samples.shape[1] + border[1] * 2
+def random_perspective(image, label, params, border=(0, 0)):
+    h = image.shape[0] + border[0] * 2
+    w = image.shape[1] + border[1] * 2
 
     # Center
     center = numpy.eye(3)
-    center[0, 2] = -samples.shape[1] / 2  # x translation (pixels)
-    center[1, 2] = -samples.shape[0] / 2  # y translation (pixels)
+    center[0, 2] = -image.shape[1] / 2  # x translation (pixels)
+    center[1, 2] = -image.shape[0] / 2  # y translation (pixels)
 
     # Perspective
     perspective = numpy.eye(3)
@@ -344,36 +424,36 @@ def random_perspective(samples, targets, params, border=(0, 0)):
     # Combined rotation matrix, order of operations (right to left) is IMPORTANT
     matrix = translate @ shear @ rotate @ perspective @ center
     if (border[0] != 0) or (border[1] != 0) or (matrix != numpy.eye(3)).any():  # image changed
-        samples = cv2.warpAffine(samples, matrix[:2], dsize=(w, h), borderValue=(0, 0, 0))
+        image = cv2.warpAffine(image, matrix[:2], dsize=(w, h), borderValue=(0, 0, 0))
 
     # Transform label coordinates
-    n = len(targets)
+    n = len(label)
     if n:
         xy = numpy.ones((n * 4, 3))
-        xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
+        xy[:, :2] = label[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
         xy = xy @ matrix.T  # transform
         xy = xy[:, :2].reshape(n, 8)  # perspective rescale or affine
 
         # create new boxes
         x = xy[:, [0, 2, 4, 6]]
         y = xy[:, [1, 3, 5, 7]]
-        new = numpy.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+        box = numpy.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
 
         # clip
-        new[:, [0, 2]] = new[:, [0, 2]].clip(0, w)
-        new[:, [1, 3]] = new[:, [1, 3]].clip(0, h)
-
+        box[:, [0, 2]] = box[:, [0, 2]].clip(0, w)
+        box[:, [1, 3]] = box[:, [1, 3]].clip(0, h)
         # filter candidates
-        indices = candidates(box1=targets[:, 1:5].T * s, box2=new.T)
-        targets = targets[indices]
-        targets[:, 1:5] = new[indices]
+        indices = candidates(box1=label[:, 1:5].T * s, box2=box.T)
 
-    return samples, targets
+        label = label[indices]
+        label[:, 1:5] = box[indices]
+
+    return image, label
 
 
 def mix_up(image1, label1, image2, label2):
     # Applies MixUp augmentation https://arxiv.org/pdf/1710.09412.pdf
-    alpha = numpy.random.beta(32.0, 32.0)  # mix-up ratio, alpha=beta=32.0
+    alpha = numpy.random.beta(a=32.0, b=32.0)  # mix-up ratio, alpha=beta=32.0
     image = (image1 * alpha + image2 * (1 - alpha)).astype(numpy.uint8)
     label = numpy.concatenate((label1, label2), 0)
     return image, label
@@ -383,23 +463,24 @@ class Albumentations:
     def __init__(self):
         self.transform = None
         try:
-            import albumentations as album
+            import albumentations
 
-            transforms = [album.Blur(p=0.01),
-                          album.CLAHE(p=0.01),
-                          album.ToGray(p=0.01),
-                          album.MedianBlur(p=0.01)]
-            self.transform = album.Compose(transforms,
-                                           album.BboxParams('yolo', ['class_labels']))
+            transforms = [albumentations.Blur(p=0.01),
+                          albumentations.CLAHE(p=0.01),
+                          albumentations.ToGray(p=0.01),
+                          albumentations.MedianBlur(p=0.01)]
+            self.transform = albumentations.Compose(transforms,
+                                                    albumentations.BboxParams('yolo', ['class_labels']))
 
         except ImportError:  # package not installed, skip
             pass
 
-    def __call__(self, image, label):
+    def __call__(self, image, box, cls):
         if self.transform:
             x = self.transform(image=image,
-                               bboxes=label[:, 1:],
-                               class_labels=label[:, 0])
+                               bboxes=box,
+                               class_labels=cls)
             image = x['image']
-            label = numpy.array([[c, *b] for c, b in zip(x['class_labels'], x['bboxes'])])
-        return image, label
+            box = numpy.array(x['bboxes'])
+            cls = numpy.array(x['class_labels'])
+        return image, box, cls

@@ -2,6 +2,7 @@ import copy
 import math
 import random
 import time
+import pathlib
 
 import numpy
 import torch
@@ -114,6 +115,29 @@ def wh2xy(x):
     y[..., 3] = x[..., 1] + x[..., 3] / 2  # bottom right y
     return y
 
+
+def compute_metric(output, target, iou_v):
+    # intersection(N,M) = (rb(N,M,2) - lt(N,M,2)).clamp(0).prod(2)
+    (a1, a2) = target[:, 1:].unsqueeze(1).chunk(2, 2)
+    (b1, b2) = output[:, :4].unsqueeze(0).chunk(2, 2)
+    intersection = (torch.min(a2, b2) - torch.max(a1, b1)).clamp(0).prod(2)
+    # IoU = intersection / (area1 + area2 - intersection)
+    iou = intersection / ((a2 - a1).prod(2) + (b2 - b1).prod(2) - intersection + 1e-7)
+
+    correct = numpy.zeros((output.shape[0], iou_v.shape[0]))
+    correct = correct.astype(bool)
+    for i in range(len(iou_v)):
+        # IoU > threshold and classes match
+        x = torch.where((iou >= iou_v[i]) & (target[:, 0:1] == output[:, 5]))
+        if x[0].shape[0]:
+            matches = torch.cat((torch.stack(x, 1),
+                                 iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
+            if x[0].shape[0] > 1:
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[numpy.unique(matches[:, 1], return_index=True)[1]]
+                matches = matches[numpy.unique(matches[:, 0], return_index=True)[1]]
+            correct[matches[:, 1].astype(int), i] = True
+    return torch.tensor(correct, dtype=torch.bool, device=output.device)
 
 def non_max_suppression(prediction, conf_threshold=0.25, iou_threshold=0.45):
     nc = prediction.shape[1] - 4  # number of classes
@@ -242,11 +266,11 @@ def compute_ap(tp, conf, pred_cls, target_cls, eps=1e-16):
 
 
 def strip_optimizer(filename):
-    x = torch.load(filename, map_location=torch.device('cpu'))
+    x = torch.load(filename, map_location=torch.device('cpu'), weights_only=False)
     x['model'].half()  # to FP16
     for p in x['model'].parameters():
         p.requires_grad = False
-    torch.save(x, filename)
+    torch.save(x['model'].state_dict(), f=f"./weights/{pathlib.Path(filename).stem}_state_dict.pt")
 
 
 def clip_gradients(model, max_norm=10.0):
@@ -339,7 +363,11 @@ class ComputeLoss:
 
         anchor_points, stride_tensor = make_anchors(x, self.stride, 0.5)
 
+        idx = targets['idx'].view(-1, 1)
+        cls = targets['cls'].view(-1, 1)
+        box = targets['box']
         # targets
+        targets = torch.cat((idx, cls, box), dim=1).to(self.device)
         if targets.shape[0] == 0:
             gt = torch.zeros(pred_scores.shape[0], 0, 5, device=self.device)
         else:
@@ -518,3 +546,60 @@ class ComputeLoss:
         with torch.no_grad():
             alpha = v / (v - iou + (1 + eps))
         return iou - (rho2 / c2 + v * alpha)  # CIoU
+
+class Colors:
+    def __init__(self):
+        hexs = (
+            "042AFF", "0BDBEB", "F3F3F3", "00DFB7", "111F68", "FF6FDD",
+            "FF444F",
+            "CCED00", "00F344", "BD00FF", "00B4FF", "DD00BA", "00FFFF",
+            "26C000",
+            "01FFB3", "7D24FF", "7B0068", "FF1B6C", "FC6D2F", "A2FF0B"
+        )
+        self.palette = [self.hex2rgb(f"#{c}") for c in hexs]
+        self.n = len(self.palette)
+        self.pose_palette = numpy.array([
+            [255, 128, 0], [255, 153, 51], [255, 178, 102], [230, 230, 0],
+            [255, 153, 255], [153, 204, 255], [255, 102, 255], [255, 51, 255],
+            [102, 178, 255], [51, 153, 255], [255, 153, 153], [255, 102, 102],
+            [255, 51, 51], [153, 255, 153], [102, 255, 102], [51, 255, 51],
+            [0, 255, 0], [0, 0, 255], [255, 0, 0], [255, 255, 255]
+        ], dtype=numpy.uint8)
+
+    def __call__(self, i, bgr=False):
+        c = self.palette[int(i) % self.n]
+        return c[::-1] if bgr else c
+
+    @staticmethod
+    def hex2rgb(h):
+        return tuple(int(h[1 + i:1 + i + 2], 16) for i in (0, 2, 4))
+
+def draw_box(im, box, index, label=""):
+    import cv2
+    color = Colors()(index, True)
+    x1, y1, x2, y2 = map(int, box[:4])
+    cv2.rectangle(im, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+
+    if label:
+        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
+        h += 3
+        outside = y1 < h + 3
+        if x1 + w > im.shape[1]:
+            x1 = im.shape[1] - w
+        y2_label = y1 + h if outside else y1 - h
+        cv2.rectangle(im, (x1, y1), (x1 + w, y2_label), color, -1)
+
+        # Draw corner markers
+        corners = [
+            ((x1, y1), (x1 + 15, y1), (x1, y1 + 15)),  # Top-left
+            ((x2, y2), (x2 - 15, y2), (x2, y2 - 15)),  # Bottom-right
+            ((x2, y1), (x2 - 15, y1), (x2, y1 + 15)),  # Top-right
+            ((x1, y2), (x1, y2 - 15), (x1 + 15, y2)),  # Bottom-left
+        ]
+        for center, *lines in corners:
+            for pt in lines:
+                cv2.line(im, center, pt, (0, 255, 255), 3)
+
+        cv2.putText(im, label, (x1, y1 + h - 3 if outside else y1 - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    return im
