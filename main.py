@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 from nets import nn
-from utils import util
+from utils import util_mod as util
 from utils.dataset import Dataset
 
 warnings.filterwarnings("ignore")
@@ -44,7 +44,7 @@ def train(args, params):
         model = nn.yolo_v8_x(len(params['names']))
     else:
         raise ValueError(f"Unsupported YOLOv8 variant: {version}. Choose from 'n', 's', 'm', 'l', 'x'.")
-    # model = nn.yolo_v11_m(len(params['names']))
+    # model = nn.yolo_v8_m(len(params['names']))
     model.cuda()
 
     # Optimizer
@@ -249,8 +249,15 @@ def test(args, params, model=None):
     loader = data.DataLoader(dataset, 8, False, num_workers=8,
                              pin_memory=True, collate_fn=Dataset.collate_fn)
 
+    plot = False
     if model is None:
-        model = torch.load(f'./weights/best_{version}_{epochs}.pt', map_location='cuda', weights_only=False)['model'].float()
+        plot = True
+        # model = torch.load(f'./weights/best_{version}_{epochs}.pt', map_location='cuda', weights_only=False)['model'].float()
+        # --- MODIFICATION: Load from save_dir ---
+        path = os.path.join(args.save_dir, "best.pt")
+        print(f"Testing model: {path}")
+        model = torch.load(f=path, map_location='cuda', weights_only=False)
+        model = model['model'].float().fuse()
 
     model.half()
     model.eval()
@@ -344,7 +351,16 @@ def test(args, params, model=None):
     # Compute metrics
     metrics = [torch.cat(x, 0).cpu().numpy() for x in zip(*metrics)]  # to np
     if len(metrics) and metrics[0].any():
-        tp, fp, m_pre, m_rec, map50, mean_ap = util.compute_ap(*metrics)
+        # tp, fp, m_pre, m_rec, map50, mean_ap = util.compute_ap(*metrics)
+        # --- MODIFICATION: Pass save_dir to compute_ap ---
+        tp, fp, m_pre, m_rec, map50, mean_ap = util.compute_ap(
+            version,
+            epochs, 
+            *metrics, 
+            plot=plot, 
+            names=params["names"],
+            save_dir=args.save_dir  # <--- PASS THIS HERE
+        )
 
     # Print results
     print('%10.3g' * 3 % (m_pre, m_rec, mean_ap))
@@ -359,18 +375,18 @@ def profile(args, params):
     print(f"params amount: {len(params['names'])}")
     version = args.version
     if version == 'n':
-        model = nn.yolo_v11_n(len(params['names'])).fuse()
+        model = nn.yolo_v8_n(len(params['names'])).fuse()
     elif version == 's':
-        model = nn.yolo_v11_s(len(params['names'])).fuse()
+        model = nn.yolo_v8_s(len(params['names'])).fuse()
     elif version == 'm':
-        model = nn.yolo_v11_m(len(params['names'])).fuse()
+        model = nn.yolo_v8_m(len(params['names'])).fuse()
     elif version == 'l':
-        model = nn.yolo_v11_l(len(params['names'])).fuse()
+        model = nn.yolo_v8_l(len(params['names'])).fuse()
     elif version == 'x':
-        model = nn.yolo_v11_x(len(params['names'])).fuse()
+        model = nn.yolo_v8_x(len(params['names'])).fuse()
     else:
-        raise ValueError(f"Unsupported YOLOv11 variant: {version}. Choose from 'n', 's', 'm', 'l', 'x'.")
-    # model = nn.yolo_v11_n(len(params['names'])).fuse()
+        raise ValueError(f"Unsupported YOLOv8 variant: {version}. Choose from 'n', 's', 'm', 'l', 'x'.")
+    # model = nn.yolo_v8_n(len(params['names'])).fuse()
 
     model.eval()
     model(torch.zeros(shape))
@@ -382,6 +398,19 @@ def profile(args, params):
     if args.local_rank == 0:
         print(f'Number of parameters: {num_params}')
         print(f'Number of FLOPs: {flops}')
+
+def zip_weights_directory(args):
+    # Zip the specific folder (e.g., weights/n5)
+    target_dir = args.save_dir
+    output_zip = f"{args.save_dir}.zip" # e.g., weights/n5.zip
+
+    if not os.path.exists(target_dir):
+        print(f"Error: {target_dir} does not exist.")
+        return
+
+    import shutil
+    shutil.make_archive(args.save_dir, 'zip', target_dir)
+    print(f"Successfully zipped {target_dir} to {output_zip}")
 
 def inference(model, args, params):
     source_type = args.inference
@@ -573,8 +602,8 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-size', default=640, type=int)
-    parser.add_argument('--batch-size', default=32, type=int)
-    parser.add_argument('--local_rank', default=0, type=int)
+    parser.add_argument('--batch-size', default=16, type=int)
+    parser.add_argument('--local-rank', default=0, type=int)
     parser.add_argument('--epochs', default=500, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
@@ -582,8 +611,20 @@ def main():
     parser.add_argument('--zip', action='store_true')
     parser.add_argument("--inference", type=str, choices=["image", "video", "camera"])
 
+    parser.add_argument('--benchmark', action='store_true', help="Run speed benchmark")
+    # --- ADD THESE TWO ---
+    parser.add_argument('--view', action='store_true', help="Show video during benchmark (slower)")
+    parser.add_argument('--timeout', type=int, default=None, help="Stop benchmark after X seconds")
+
     args = parser.parse_args()
     print(args)
+
+    # --- STRATEGY: Define Dynamic Save Directory ---
+    # Example result: ./weights/n5 or ./weights/s100
+    run_name = f"{args.version}{args.epochs}"
+    args.save_dir = os.path.join("weights", run_name)
+    print(f"Output Directory: {args.save_dir}")
+    # -----------------------------------------------
 
     args.local_rank = int(os.getenv('LOCAL_RANK', 0))
     args.world_size = int(os.getenv('WORLD_SIZE', 1))
@@ -599,8 +640,10 @@ def main():
 
     with open(os.path.join('utils', 'args.yaml'), errors='ignore') as f:
         params = yaml.safe_load(f)
+
     util.setup_seed()
     util.setup_multi_processes()
+
     profile(args, params)
 
     if args.train:
@@ -608,21 +651,29 @@ def main():
     if args.test:
         test(args, params)
 
+    # Clean
+    if args.distributed:
+        torch.distributed.destroy_process_group()
+    torch.cuda.empty_cache()
+
+    if args.zip:
+        zip_weights_directory(args)
+
     if args.inference:
         # print(args.inference)
         # version = args.version
         # if version == 'n':
-        #     model = nn.yolo_v11_n(len(params['names']))
+        #     model = nn.yolo_v8_n(len(params['names']))
         # elif version == 's':
-        #     model = nn.yolo_v11_s(len(params['names']))
+        #     model = nn.yolo_v8_s(len(params['names']))
         # elif version == 'm':
-        #     model = nn.yolo_v11_m(len(params['names']))
+        #     model = nn.yolo_v8_m(len(params['names']))
         # elif version == 'l':
-        #     model = nn.yolo_v11_l(len(params['names']))
+        #     model = nn.yolo_v8_l(len(params['names']))
         # elif version == 'x':
-        #     model = nn.yolo_v11_x(len(params['names']))
+        #     model = nn.yolo_v8_x(len(params['names']))
         # else:
-        #     raise ValueError(f"Unsupported YOLOv11 variant: {version}. Choose from 'n', 's', 'm', 'l', 'x'.")
+        #     raise ValueError(f"Unsupported YOLOv8 variant: {version}. Choose from 'n', 's', 'm', 'l', 'x'.")
         # model_path = f"./weights/original/best.pt"
         model_path = f"./weights/best_{args.version}_{args.epochs}.pt"
         model_data = torch.load(model_path, map_location="cuda", weights_only=False)

@@ -1,0 +1,103 @@
+lr0: 0.010                    # initial learning rate (SGD=1E-2, Adam=1E-3)
+lrf: 0.010                    # final OneCycleLR learning rate (lr0 * lrf)
+momentum: 0.93700000          # SGD momentum/Adam beta1
+weight_decay: 0.0005          # optimizer weight decay 5e-4
+warmup_epochs: 3.000          # warmup epochs
+warmup_momentum: 0.8          # warmup initial momentum
+warmup_bias_lr: 0.10          # warmup initial bias lr
+box: 7.5                      # box loss gain
+cls: 0.5                      # cls loss gain
+dfl: 1.5                      # cls loss gain
+hsv_h: 0.015000               # image HSV-Hue augmentation (fraction)
+hsv_s: 0.700000               # image HSV-Saturation augmentation (fraction)
+hsv_v: 0.400000               # image HSV-Value augmentation (fraction)
+degrees: 0.0000               # image rotation (+/- deg)
+translate: 0.10               # image translation (+/- fraction)
+scale: 0.500000               # image scale (+/- gain)
+shear: 0.000000               # image shear (+/- deg)
+flip_ud: 0.0000               # image flip up-down (probability)
+flip_lr: 0.5000               # image flip left-right (probability)
+mosaic: 1.00000               # image mosaic (probability)
+mix_up: 0.00000               # image mix-up (probability)
+# classes
+names:
+  0: bowl
+  1: broccoli
+  2: orange
+  3: giraffe
+  4: potted plant
+  5: vase
+  6: zebra
+  7: umbrella
+  8: person
+  9: dog
+  10: horse
+  11: elephant
+  12: car
+  13: truck
+  14: stop sign
+  15: clock
+  16: train
+  17: motorcycle
+  18: bicycle
+  19: skateboard
+  20: airplane
+  21: handbag
+  22: knife
+  23: oven
+  24: microwave
+  25: book
+  26: fork
+  27: cake
+  28: bench
+  29: chair
+  30: pizza
+  31: dining table
+  32: cup
+  33: spoon
+  34: bed
+  35: teddy bear
+  36: refrigerator
+  37: sink
+  38: bottle
+  39: banana
+  40: sandwich
+  41: bird
+  42: kite
+  43: wine glass
+  44: tie
+  45: scissors
+  46: baseball bat
+  47: carrot
+  48: snowboard
+  49: toothbrush
+  50: couch
+  51: remote
+  52: traffic light
+  53: backpack
+  54: bus
+  55: suitcase
+  56: frisbee
+  57: hot dog
+  58: cell phone
+  59: baseball glove
+  60: sports ball
+  61: skis
+  62: mouse
+  63: laptop
+  64: boat
+  65: tennis racket
+  66: donut
+  67: cat
+  68: bear
+  69: toilet
+  70: tv
+  71: apple
+  72: surfboard
+  73: keyboard
+  74: sheep
+  75: parking meter
+  76: fire hydrant
+  77: cow
+  78: toaster
+  79: hair drier
