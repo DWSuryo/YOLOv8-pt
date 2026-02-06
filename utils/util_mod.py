@@ -398,6 +398,22 @@ def clip_gradients(model, max_norm=10.0):
     parameters = model.parameters()
     torch.nn.utils.clip_grad_norm_(parameters, max_norm=max_norm)
 
+def set_params(model, decay):
+    p1 = []
+    p2 = []
+    norm = tuple(v for k, v in torch.nn.__dict__.items() if "Norm" in k)
+    for m in model.modules():
+        for n, p in m.named_parameters(recurse=0):
+            if not p.requires_grad:
+                continue
+            if n == "bias":  # bias (no decay)
+                p1.append(p)
+            elif n == "weight" and isinstance(m, norm):  # norm-weight (no decay)
+                p1.append(p)
+            else:
+                p2.append(p)  # weight (with decay)
+    return [{'params': p1, 'weight_decay': 0.00},
+            {'params': p2, 'weight_decay': decay}]
 
 class EMA:
     """
@@ -544,7 +560,7 @@ class ComputeLoss:
         loss_cls *= self.params['cls']
         loss_box *= self.params['box']
         loss_dfl *= self.params['dfl']
-        return loss_cls + loss_box + loss_dfl  # loss(cls, box, dfl)
+        return loss_cls, loss_box, loss_dfl  # loss(cls, box, dfl)
 
     @torch.no_grad()
     def assign(self, pred_scores, pred_bboxes, true_labels, true_bboxes, true_mask, anchors):
