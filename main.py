@@ -288,7 +288,7 @@ def test(args, params, model=None):
             filenames.append(f'{data_dir}/images/val2017/' + filename)
 
     dataset = Dataset(filenames, args.input_size, params, False)
-    loader = data.DataLoader(dataset, 8, False, num_workers=8,
+    loader = data.DataLoader(dataset, batch_size=4, shuffle=False, num_workers=4,
                              pin_memory=True, collate_fn=Dataset.collate_fn)
 
     plot = False
@@ -472,6 +472,7 @@ def inference(model, args, params):
         start_event.record()
         
         # Preprocessing, Inference, and Post-processing for a single image
+        # 1. Pre-process (Don't time this if checking Model Speed)
         image = frame.copy()
         shape = image.shape[:2]
 
@@ -498,21 +499,31 @@ def inference(model, args, params):
         # Convert HWC to CHW, BGR to RGB
         x = image.transpose((2, 0, 1))[::-1]
         x = np.ascontiguousarray(x)
-        x = torch.from_numpy(x)
-        x = x.unsqueeze(dim=0)
-        x = x.cuda()
-        x = x.half()
-        x = x / 255
+        x = torch.from_numpy(x).unsqueeze(dim=0).cuda().half()/255.0
+        # x = x.unsqueeze(dim=0)
+        # x = x.cuda()
+        # x = x.half()
+        # x = x / 255
 
-        # Inference
+        # 2. Pure Inference Timer
+        start_event.record()
         outputs = model(x)
-        # NMS
+        end_event.record()
+        torch.cuda.synchronize()
+        model_latency = start_event.elapsed_time(end_event)
+
+        # 3. Post-process (NMS) Timer
+        t0 = time.time()
         outputs = util.non_max_suppression(outputs, 0.15, 0.2)[0]
+        nms_time = (time.time() - t0) * 1000
         
         # End timing and calculate latency
         end_event.record()
         torch.cuda.synchronize()
         latency_ms = start_event.elapsed_time(end_event)
+
+        # Total System Latency
+        total_latency = model_latency + nms_time
         
         if outputs is not None:
             outputs[:, [0, 2]] -= w
@@ -530,7 +541,7 @@ def inference(model, args, params):
                 util.draw_box(frame, box, index, label)
 
         # Display latency on the image
-        latency_text = f"Latency: {latency_ms:.2f} ms"
+        latency_text = f"Model: {model_latency:.1f}ms | NMS: {nms_time:.1f}ms | Total: {total_latency:.1f}ms"
         cv2.putText(frame, latency_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
         cv2.imshow('Inference Result', frame)
@@ -540,8 +551,7 @@ def inference(model, args, params):
     else:
         # The existing code for video and camera inference (which works)
         # This part remains unchanged
-        # model = model['model'].float()
-        # model = torch.load(f'./weights/best_{args.version}_{args.epochs}.pt', 'cuda', weights_only=False)['model'].float()
+        model = torch.load(f'./weights/{args.version}{args.epochs}/best.pt', 'cuda', weights_only=False)['model'].float()
         model.half()
         model.eval()
 
@@ -581,7 +591,13 @@ def inference(model, args, params):
 
                 start_event.record()
 
+                # --- TIMER 1: Start System Timer ---
+                t_start_system = time.time()
+
+                # 1. Pre-processing (CPU)
+                t_prep_start = time.time()
                 image = frame.copy()
+
                 shape = image.shape[:2]
                 r = args.input_size / max(shape[0], shape[1])
                 if r != 1:
@@ -599,16 +615,36 @@ def inference(model, args, params):
                 image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT)
                 x = image.transpose((2, 0, 1))[::-1]
                 x = np.ascontiguousarray(x)
-                x = torch.from_numpy(x)
-                x = x.unsqueeze(dim=0)
-                x = x.cuda()
-                x = x.half()
-                x = x / 255
+
+                x = torch.from_numpy(x).unsqueeze(dim=0).cuda().half() / 255
+                # x = x.unsqueeze(dim=0)
+                # x = x.cuda()
+                # x = x.half()
+                # x = x / 255
+                t_prep_end = time.time()
+
+                # 2. Inference (GPU)
+                # We use CUDA events for precise GPU timing
+                start_event = torch.Event('cuda', enable_timing=True)
+                end_event = torch.Event('cuda', enable_timing=True)
+                
+                start_event.record()
+
                 outputs = model(x)
-                outputs = util.non_max_suppression(outputs, 0.15, 0.2)[0]
                 end_event.record()
-                torch.cuda.synchronize()
-                latency_ms = start_event.elapsed_time(end_event)
+                torch.cuda.synchronize() # Wait for GPU to finish
+                inference_time_ms = start_event.elapsed_time(end_event) # Pure Model Time
+                
+                # 3. NMS (CPU)
+                t_nms_start = time.time()
+                outputs = util.non_max_suppression(outputs, 0.15, 0.2)[0]
+                t_nms_end = time.time()
+                # Calculate Latencies
+                preprocess_ms = (t_prep_end - t_prep_start) * 1000
+                nms_ms = (t_nms_end - t_nms_start) * 1000
+                e2e_latency_ms = preprocess_ms + inference_time_ms + nms_ms
+
+                # 4. Visualization (CPU - Slow!)
                 if outputs is not None:
                     outputs[:, [0, 2]] -= w
                     outputs[:, [1, 3]] -= h
@@ -624,14 +660,40 @@ def inference(model, args, params):
                         label = f"{class_name} {score:.2f}"
                         util.draw_box(frame, box, index, label)
                 
-                fps_text = f"FPS: {fps_display:.2f}"
-                latency_text = f"Latency: {latency_ms:.2f} ms"
-                cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(frame, latency_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                # fps_text = f"FPS: {fps_display:.2f}"
+                # latency_text = f"Latency: {latency_ms:.2f} ms"
+                # cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                # cv2.putText(frame, latency_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-                cv2.imshow('Frame', frame)
+                # cv2.imshow('Frame', frame)
+                # out.write(frame)
+
+                # 5. FPS Calculation (Moving Average)
+                # We use t_start_system to capture the FULL loop time
+                system_latency_ms = (time.time() - t_start_system) * 1000
+                current_fps = 1000.0 / (system_latency_ms + 1e-8)
+                
+                # Smoothing the FPS display so it doesn't flicker
+                fps_display = 0.9 * fps_display + 0.1 * current_fps
+
+                # --- DISPLAY STATS ---
+                # Line 1: Real System Speed
+                theoretical_fps = 1000.0 / e2e_latency_ms
+                cv2.putText(frame, f"System FPS: {fps_display:.1f} | Model Potential: {theoretical_fps:.0f} FPS", (10, 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                
+                # Line 2: The breakdown (Why is it slow?)
+                info_text = f"Pre:{preprocess_ms:.1f}ms | Inf:{inference_time_ms:.1f}ms | NMS:{nms_ms:.1f}ms"
+                cv2.putText(frame, info_text, (10, 60), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+                # # Line 3: Theoretical Max FPS (If you removed display/webcam bottleneck)
+                # cv2.putText(frame, f"Model Potential: {theoretical_fps:.0f} FPS", (10, 90), 
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+                cv2.imshow('Inference', frame)
                 out.write(frame)
-                if cv2.waitKey(25) & 0xFF == ord('q'):
+                if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
             else:
                 break
