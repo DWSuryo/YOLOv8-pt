@@ -386,12 +386,12 @@ def compute_iou(box1, box2, eps=1e-7, CIoU=False):
         alpha = v / (v - iou + (1 + eps))
     return iou - (rho2 / c2 + v * alpha)  # CIoU
 
-def strip_optimizer(filename):
+def strip_optimizer(filename, args):
     x = torch.load(filename, map_location=torch.device('cpu'), weights_only=False)
     x['model'].half()  # to FP16
     for p in x['model'].parameters():
         p.requires_grad = False
-    torch.save(x['model'].state_dict(), f=f"./weights/{pathlib.Path(filename).stem}_state_dict.pt")
+    torch.save(x['model'].state_dict(), f=f"./weights/{args.version}{args.epochs}/{pathlib.Path(filename).stem}_state_dict.pt")
 
 
 def clip_gradients(model, max_norm=10.0):

@@ -270,8 +270,8 @@ def train(args, params):
                 del ckpt
 
     if args.local_rank == 0:
-        util.strip_optimizer(f'./weights/{version}{args.epochs}/last.pt')  # strip optimizers
-        util.strip_optimizer(f'./weights/{version}{args.epochs}/best.pt')  # strip optimizers
+        util.strip_optimizer(f'./weights/{version}{args.epochs}/last.pt', args)  # strip optimizers
+        util.strip_optimizer(f'./weights/{version}{args.epochs}/best.pt', args)  # strip optimizers
 
     torch.cuda.empty_cache()
     plot_mAP(args)
@@ -912,6 +912,7 @@ def main():
     # --- ADD THESE TWO ---
     parser.add_argument('--view', action='store_true', help="Show video during benchmark (slower)")
     parser.add_argument('--timeout', type=int, default=None, help="Stop benchmark after X seconds")
+    parser.add_argument('--state-dict', action='store_true', help="Converts model into state_dict model")
 
     args = parser.parse_args()
     print(args)
@@ -985,6 +986,10 @@ def main():
             benchmark(model, args, params)
         else:
             inference(model, args, params)
+
+    if args.state_dict:
+        util.strip_optimizer(f'./weights/{args.version}{args.epochs}/last.pt', args)  # strip optimizers
+        util.strip_optimizer(f'./weights/{args.version}{args.epochs}/best.pt', args)  # strip optimizers
 
     time_end = datetime.now()
     print("Finished at Date and Time:", time_end.strftime("%Y-%m-%d %H:%M:%S"))
